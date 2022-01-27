@@ -12,20 +12,14 @@ public class PerlinOctave
 [RequireComponent(typeof(MeshFilter))]
 public class ProcGenTile : MonoBehaviour
 {
-    public enum EResolution
-    {
-        Size_64x64      = 64,
-        Size_128x128    = 128,
-        Size_256x256    = 256,
-        Size_512x512    = 512,
-    }
+    [SerializeField] ProcGenConfig Config;
+    [SerializeField] GameObject Modifiers;
 
-    [SerializeField] float TileSize = 200f;
-    [SerializeField] EResolution Resolution = EResolution.Size_64x64;
-    [SerializeField] float MaxHeight = 100f;
-
-    [SerializeField] List<PerlinOctave> HeightNoise = new List<PerlinOctave>();
-    [SerializeField] Vector2 HeightNoiseScale = new Vector2(8f, 8f);
+    float TileSize => Config.TileSize;
+    ETerrainResolution TerrainResolution => Config.TerrainResolution;
+    float MaxHeight => Config.MaxHeight;
+    EPaintingMode PaintingMode => Config.PaintingMode;
+    ETextureResolution TextureResolution => Config.TextureResolution;
 
     MeshFilter LinkedMeshFilter;
 
@@ -53,7 +47,7 @@ public class ProcGenTile : MonoBehaviour
         Color[] vertexColours;
         int[] triangleIndices;
 
-        int numVertsPerSide = (int)Resolution;
+        int numVertsPerSide = (int)TerrainResolution;
         int totalNumVerts = numVertsPerSide * numVertsPerSide;
         float vertexSpacing = TileSize / (numVertsPerSide - 1);
         float halfTileSize = TileSize * 0.5f;
@@ -95,14 +89,20 @@ public class ProcGenTile : MonoBehaviour
             }
         }
 
-        // Modify the terrain height
-        PerformMeshGeneration_Height(numVertsPerSide, vertices);
-
         // generate the UVs
         for (int vertIndex = 0; vertIndex < totalNumVerts; ++vertIndex)
         {
             meshUVs[vertIndex] = new Vector2((vertices[vertIndex].x + halfTileSize) / TileSize, 
                                              (vertices[vertIndex].z + halfTileSize) / TileSize);
+        }
+
+        var allModifiers = Modifiers.GetComponents<BaseModifier>();
+
+        // run the initial generation
+        foreach(var modifier in allModifiers)
+        {
+            if (modifier.Phase == EProcGenPhase.Initial)
+                modifier.Execute(numVertsPerSide, vertices, vertexColours, null, null, Config, this);
         }
 
         // Create the mesh
@@ -119,60 +119,57 @@ public class ProcGenTile : MonoBehaviour
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
 
-        // TODO - paint the mesh
-        PerformMeshGeneration_Paint(numVertsPerSide, vertices, vertexColours, mesh.normals);
+        // after the normal generation
+        var vertexNormals = mesh.normals;
+        foreach (var modifier in allModifiers)
+        {
+            if (modifier.Phase == EProcGenPhase.AfterNormals)
+                modifier.Execute(numVertsPerSide, vertices, vertexColours, vertexNormals, null, Config, this);
+        }
 
         mesh.SetColors(vertexColours);
 
+        Texture2D finalTexture = null;
+        if (PaintingMode == EPaintingMode.TextureBased)
+        {
+            // generate the initial texture
+            Texture2D initialTexture = new Texture2D(numVertsPerSide, numVertsPerSide, TextureFormat.RGB24, true);
+            initialTexture.SetPixels(vertexColours);
+            initialTexture.Apply();
+
+            finalTexture = initialTexture;
+
+            // texture and terrain resolution are different?
+            if ((int)TextureResolution != (int)TerrainResolution)
+            {
+                // setup the temporary render texture and switch to it
+                RenderTexture targetRT = new RenderTexture((int)TextureResolution, (int)TextureResolution, 24);
+                var previousRT = RenderTexture.active;
+                RenderTexture.active = targetRT;
+
+                Graphics.Blit(initialTexture, targetRT);
+
+                // grab the texture
+                finalTexture = new Texture2D((int)TextureResolution, (int)TextureResolution, TextureFormat.RGB24, true);
+                finalTexture.ReadPixels(new Rect(0, 0, (int)TextureResolution, (int)TextureResolution), 0, 0);
+                finalTexture.Apply();
+
+                finalTexture.filterMode = FilterMode.Bilinear;
+                finalTexture.wrapMode = TextureWrapMode.Clamp;
+
+                RenderTexture.active = previousRT;
+
+                LinkedMeshFilter.GetComponent<MeshRenderer>().material.SetTexture("_BaseMap", finalTexture);
+            }
+        }
+
+        // final post processing
+        foreach (var modifier in allModifiers)
+        {
+            if (modifier.Phase == EProcGenPhase.PostProcess)
+                modifier.Execute(numVertsPerSide, vertices, vertexColours, vertexNormals, finalTexture, Config, this);
+        }
+
         LinkedMeshFilter.mesh = mesh;
-    }
-
-    void PerformMeshGeneration_Height(int numVertsPerSide, Vector3[] vertices)
-    {
-        if (HeightNoise.Count == 0)
-            HeightNoise.Add(new PerlinOctave() { Amplitude = 1f, Frequency = 1f });
-
-        // apply the octaves
-        for (int octave = 0; octave < HeightNoise.Count; octave++)
-        {
-            var octaveConfig = HeightNoise[octave];
-            Vector2 currentScale = HeightNoiseScale * octaveConfig.Frequency;
-
-            for (int row = 0; row < numVertsPerSide; row++)
-            {
-                float rowProgress = (transform.position.z / TileSize) + ((float)row / (numVertsPerSide - 1));
-                rowProgress *= currentScale.x;
-
-                for (int col = 0; col < numVertsPerSide; col++)
-                {
-                    float colProgress = (transform.position.x / TileSize) + ((float)col / (numVertsPerSide - 1));
-                    colProgress *= currentScale.y;
-
-                    int vertIndex = row * numVertsPerSide + col;
-
-                    float height = MaxHeight * Mathf.PerlinNoise(rowProgress, colProgress);
-                    vertices[vertIndex].y += height * octaveConfig.Amplitude;
-                }
-            }
-        }
-    }
-
-    void PerformMeshGeneration_Paint(int numVertsPerSide, Vector3[] vertices, Color[] vertexColours, Vector3[] normals)
-    {
-        for (int row = 0; row < numVertsPerSide; row++)
-        {
-            for (int col = 0; col < numVertsPerSide; col++)
-            {
-                int vertIndex = row * numVertsPerSide + col;
-
-                float heightProgress = vertices[vertIndex].y / MaxHeight;
-
-                // paint based on height
-                vertexColours[vertIndex] = Color.Lerp(Color.green, Color.white, heightProgress);
-
-                // paint based on steepness
-                //vertexColours[vertIndex] = Color.Lerp(Color.red, Color.white, normals[vertIndex].y);
-            }
-        }
     }
 }
